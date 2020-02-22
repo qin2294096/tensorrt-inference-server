@@ -162,27 +162,37 @@ DynamicBatchScheduler::Enqueue(
   // scheduling process
   stats->CaptureTimestamp(ModelInferStats::TimestampKind::kQueueStart);
 
+  auto& request_header = request_provider->RequestHeader();
+  Status enqueue_status;
   bool wake_runner = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    queue_.emplace_back(stats, request_provider, response_provider, OnComplete);
-    queued_batch_size_ += request_provider->RequestHeader().batch_size();
+    enqueue_status = queue_.Emplace(
+        request_header.priority(), stats, request_provider, response_provider,
+        OnComplete);
+    if (enqueue_status.IsOk()) {
+      queued_batch_size_ += request_header.batch_size();
 
-    // If there are any idle runners and the queued batch size is greater or
-    // equal to next preferred batch size, then wake one up to service this
-    // request. We do the actual wake outside of the lock to avoid having the
-    // woken thread immediately block on the lock
-    wake_runner = (idle_scheduler_thread_cnt_ > 0);
+      // If there are any idle runners and the queued batch size is greater or
+      // equal to next preferred batch size, then wake one up to service this
+      // request. We do the actual wake outside of the lock to avoid having the
+      // woken thread immediately block on the lock
+      wake_runner = (idle_scheduler_thread_cnt_ > 0);
 
-    // We may wake up runner less often if we don't enforce equal shape within
-    // a batch, otherwise must always wake up runner to check it
-    if (enforce_equal_shape_tensors_.empty()) {
-      wake_runner &= (queued_batch_size_ >= next_preferred_batch_size_);
+      // We may wake up runner less often if we don't enforce equal shape within
+      // a batch, otherwise must always wake up runner to check it
+      if (enforce_equal_shape_tensors_.empty()) {
+        wake_runner &= (queued_batch_size_ >= next_preferred_batch_size_);
+      }
     }
   }
 
   if (wake_runner) {
     cv_.notify_one();
+  }
+
+  if (!enqueue_status.IsOk()) {
+    OnComplete(enqueue_status);
   }
 }
 
@@ -264,13 +274,13 @@ DynamicBatchScheduler::SchedulerThread(
         // Debugging/testing... wait until queue contains 'delay_cnt'
         // items...
         wait_microseconds = 10 * 1000;
-        if (queue_.size() >= delay_cnt) {
+        if (queue_.Size() >= delay_cnt) {
           delay_cnt = 0;
         }
         LOG_INFO << "Delaying scheduler thread " << runner_id << " until "
                  << delay_cnt
                  << " queued payloads, current total = " << queue_.size();
-      } else if (queue_.empty()) {
+      } else if (queue_.Empty()) {
         wait_microseconds = default_wait_microseconds;
       } else if (dynamic_batching_enabled_) {
         // Use dynamic batching to get request payload(s) to execute.
@@ -278,8 +288,7 @@ DynamicBatchScheduler::SchedulerThread(
         if (wait_microseconds == 0) {
           payloads = std::make_shared<std::vector<Scheduler::Payload>>();
           for (size_t idx = 0; idx < pending_batch_queue_cnt_; ++idx) {
-            payloads->emplace_back(std::move(queue_.front()));
-            queue_.pop_front();
+            payloads->emplace_back(std::move(queue_.Dequeue()));
           }
           if (preserve_ordering_) {
             std::lock_guard<std::mutex> lock(runner_queue_mtx_);
@@ -307,13 +316,12 @@ DynamicBatchScheduler::SchedulerThread(
           // handling those requests. We do the actual wake outside of
           // the lock to avoid having the woken thread immediately
           // block on the lock.
-          wake_thread = !queue_.empty() && (idle_scheduler_thread_cnt_ > 0);
+          wake_thread = !queue_.Empty() && (idle_scheduler_thread_cnt_ > 0);
         }
       } else {
         // No batching... execute next request payload
         payloads = std::make_shared<std::vector<Scheduler::Payload>>();
-        payloads->emplace_back(std::move(queue_.front()));
-        queue_.pop_front();
+        payloads->emplace_back(std::move(queue_.Dequeue()));
         if (preserve_ordering_) {
           std::lock_guard<std::mutex> lock(runner_queue_mtx_);
           runner_queue_.push(runner_id);
@@ -385,7 +393,7 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
   size_t best_preferred_batch_cnt = 0;
   size_t search_batch_size = pending_batch_size_;
   size_t search_batch_cnt = pending_batch_queue_cnt_;
-  for (auto idx = pending_batch_queue_cnt_; idx < queue_.size(); ++idx) {
+  for (auto idx = pending_batch_queue_cnt_; idx < queue_.Size(); ++idx) {
     const auto batch_size =
         queue_[idx].request_provider_->RequestHeader().batch_size();
 
