@@ -45,56 +45,6 @@ namespace nvidia { namespace inferenceserver {
 
 class RequestQueue {
  public:
-  class Iterator {
-   public:
-    Iterator(
-        std::deque<Scheduler::Payload>& q, std::deque<Scheduler::Payload>& dq)
-        : at_dq_(false), citr_(q.begin()), end_itr_(q.end()),
-          dqbegin_itr_(dq.begin()), dqend_itr_(dq.end())
-    {
-    }
-
-    Iterator& operator++()
-    {
-      if ((++citr_ == end_itr_) && !at_dq_) {
-        citr_ = dqbegin_itr_;
-        end_itr_ = dqend_itr_;
-        at_dq_ = true;
-      }
-      return *this;
-    }
-
-    Iterator& operator=(const Iterator& rhs)
-    {
-      at_dq_ = rhs.at_dq_;
-      citr_ = rhs.citr_;
-      end_itr_ = rhs.end_itr_;
-      dqbegin_itr_ = rhs.dqbegin_itr_;
-      dqend_itr_ = rhs.dqend_itr_;
-
-      return *this;
-    }
-
-    bool operator!=(const Iterator& rhs)
-    {
-      return !(this->operator==(rhs));
-    }
-
-    bool operator==(const Iterator& rhs)
-    {
-      return (at_dq_ == rhs.at_dq_) && (citr_ == rhs.citr_);
-    }
-
-    Scheduler::Payload& operator*() { return *citr_; }
-
-   private:
-    bool at_dq_;
-    std::deque<Scheduler::Payload>::iterator citr_;
-    std::deque<Scheduler::Payload>::iterator end_itr_;
-    std::deque<Scheduler::Payload>::iterator dqbegin_itr_;
-    std::deque<Scheduler::Payload>::iterator dqend_itr_;
-  };
-
   RequestQueue(const ModelQueuePolicy& policy)
       : action_(policy.action()),
         default_timeout_microseconds_(policy.default_timeout_microseconds()),
@@ -110,31 +60,32 @@ class RequestQueue {
       return Status(
           RequestStatusCode::UNAVAILABLE, "Exceeds maximum queue size");
     }
-    queue_.emplace_back(args);
+    queue_.emplace_back(0, Scheduler::Payload(args));
     auto timeout_microseconds = default_timeout_microseconds_;
-    if (allow_timeout_override_ && queue_.back()
+    if (allow_timeout_override_ && queue_.back().second.
                                            .request_provider_.RequestHeader()
                                            .timeout_microseconds() != 0) {
-      timeout_microseconds = queue_.back()
+      timeout_microseconds = queue_.back().second.
                                  .request_provider_.RequestHeader()
                                  .timeout_microseconds();
     }
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    timeout_queue_.emplace_back(
-        TIMESPEC_TO_NANOS(now), timeout_microseconds * 1000);
+    if (timeout_microseconds != 0) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      queue_.back().first = TIMESPEC_TO_NANOS(now) + timeout_microseconds * 1000;
+    }
+    
     return Status::Success;
   }
 
   Scheduler::Payload Dequeue()
   {
     if (!queue_.empty()) {
-      auto res = std::move(queue_.front());
+      auto res = std::move(queue_.front().second);
       queue_.pop_front();
-      timeout_queue_.pop_front();
       return res;
     } else {
-      auto res = std::move(delayed_queue_.front());
+      auto res = std::move(delayed_queue_.front().second);
       delayed_queue_.pop_front();
       return res;
     }
@@ -145,14 +96,14 @@ class RequestQueue {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     auto now_nanoseconds = TIMESPEC_TO_NANOS(now);
-    auto& dst_queue = action_ == DELAY ? delayed_queue_ : rejected_queue_;
     for (auto idx = 0; idx != queue_.size();) {
-      if ((timeout_queue_[idx].second != 0) &&
-          (now_nanoseconds - timeout_queue_[idx].first >
-           timeout_queue_[idx].second)) {
-        dst_queue.emplace_back(std::move(queue_[idx]));
+      if ((queue_[idx].first != 0) && (now_nanoseconds > queue_[idx].first)) {
+        if (action_ == DELAY) {
+          delayed_queue.emplace_back(0, std::move(queue_[idx].second));
+        } else {
+          rejected_queue_.emplace_back(std::move(queue_[idx].second));
+        }
         queue_.erase(queue_.begin() + idx);
-        timeout_queue_.erase(timeout_queue_.begin() + idx);
       } else {
         // only advance the index if the current item is still valid
         idx++;
@@ -167,26 +118,22 @@ class RequestQueue {
     return res;
   }
 
+  std::pair<uint64_t, Scheduler::Payload>& operator[](size_t idx) {
+    if (idx < queue_.size()) {
+      return queue_[idx];
+    } else {
+      return delayed_queue_[idx - queue_.size()];
+    }
+  }
+
   bool Empty() { return Size() == 0; }
 
   size_t Size() { return queue_.size() + delayed_queue_.size(); }
 
-  Iterator Begin()
-  {
-    return Iterator(queue_, delayed_queue_);
-  }
-
-  const Iterator& End()
-  {
-    return end_itr_;
-  }
-
  private:
-  std::deque<Scheduler::Payload> queue_;
-  std::deque<uint64_t, uint64_t> timeout_queue_;
-  std::deque<Scheduler::Payload> delayed_queue_;
+  std::deque<std::pair<uint64_t, Scheduler::Payload>> queue_;
+  std::deque<std::pair<uint64_t, Scheduler::Payload>> delayed_queue_;
   std::deque<Scheduler::Payload> rejected_queue_;
-  Iterator end_itr_;
   const TimeoutAction action_;
   const uint64_t default_timeout_microseconds_;
   const bool allow_timeout_override_;
@@ -195,48 +142,19 @@ class RequestQueue {
 
 class PriorityQueue {
  public:
-  using PriorityQueues = std::map<uint32_t, RequestQueue>;
-
-  class Iterator {
-   public:
-    Iterator(PriorityQueues::iterator qitr, RequestQueue::Iterator ritr) : qitr_(qitr), ritr_(ritr) {}
-
-    Iterator& operator++()
-    {
-      if ((++ritr_) == qitr_->second.End()) {
-        ++qitr_;
-        ritr_ = qitr_->second.Begin();
-      }
-      return *this;
-    }
-
-    bool operator!=(const Iterator& rhs)
-    {
-      return !(*this==(rhs));
-    }
-
-    bool operator==(const Iterator& rhs)
-    {
-      return (qitr_ == rhs.qitr_) && (ritr_ == rhs.ritr_);
-    }
-
-    Scheduler::Payload& operator*() { return *ritr_; }
-
-    Scheduler::Payload* operator->() { return &(*ritr_); }
-
-   private:
-    PriorityQueues::iterator qitr_;
-    RequestQueue::Iterator ritr_;
-  };
-
   template <typename... Args>
   Status Emplace(uint32_t priority_level, Args&&... args)
   {
-    return queues_[priority_level].Emplace(args);
+    auto status = queues_[priority_level].Emplace(args);
+    if (status.IsOk()) {
+      pending_cursor_.valid_ &= (priority_level >= pending_cursor_.curr_it_->first);
+    }
+    return status;
   }
 
   Scheduler::Payload Dequeue()
   {
+    pending_cursor_.valid_ = false;
     for (auto& queue : queues_) {
       if (!queue.second.Empty()) {
         return queue.second.Dequeue();
@@ -254,27 +172,52 @@ class PriorityQueue {
 
   bool Empty() { return Size() == 0; }
 
-  Iterator&
-  PendingIterator() {
+  Scheduler::Payload& PayloadAtCursor() {
     return pending_iterator_;
   }
 
-  Iterator Begin()
-  {
-    return Iterator(
-        queues_.begin(), queues_.begin()->second.Begin());
-  }
+  /* TODO: complete below */
 
-  Iterator End()
-  {
-    auto last_queue = queues_.end()--;
-    return Iterator(last_queue, last_queue->second.End());
-  }
+  void MarkCursor() { current_mark_ = pending_cursor_; }
+
+  void Next() {}
+
+  void ResetCursor() { pending_cursor_ = Cursor(queues_.begin(), queues_.end()); }
+
+  void SetCursorToMark() { pending_cursor_ = current_mark_; }
+
+  bool IsCursorValid() { return pending_cursor_.valid_; }
 
  private:
+  using PriorityQueues = std::map<uint32_t, RequestQueue>;
   PriorityQueues queues_;
-  Iterator pending_iterator_;
-  bool is_iterator_valid_;
+
+  struct Cursor {
+    Cursor(PriorityQueues::iterator start_it, PriorityQueues::iterator end_it)
+      : curr_it_(start_it), end_it_(end_it), queue_idx_(0),
+        closest_timeout_ns_(0), valid_(false)
+    {
+      while (curr_it_ != end_it_) {
+        if (curr_it_->second.Size() != 0) {
+          closest_timeout_ns_ = curr_it_->second[0].first;
+          valid_ = true;
+          break;
+        }
+        curr_it_+=;
+      }
+    }
+
+    Cursor(const Cursor& rhs) : priority_it_(rhs.priority_it_), queue_idx_(rhs.queue_idx_),
+    closest_timeout_ns_(rhs.closest_timeout_ns_) {}
+    PriorityQueues::iterator curr_it_;
+    PriorityQueues::iterator end_it_;
+    size_t queue_idx_;
+    uint64_t closest_timeout_ns_;
+    bool valid_;
+  };
+
+  Cursor pending_cursor_;
+  Cursor current_mark_;
 };
 
 // Scheduler that implements dynamic batching.
