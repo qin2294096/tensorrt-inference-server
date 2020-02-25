@@ -29,6 +29,8 @@
 #include <future>
 #include <thread>
 #include "src/backends/onnx/onnx_utils.h"
+#include "src/core/constants.h"
+#include "src/core/filesystem.h"
 
 namespace nvidia { namespace inferenceserver {
 
@@ -90,8 +92,8 @@ OnnxLoader::Stop()
 
 Status
 OnnxLoader::LoadSession(
-    const std::string& model_data, const OrtSessionOptions* session_options,
-    OrtSession** session)
+    const std::pair<bool, std::string>& model_data,
+    const OrtSessionOptions* session_options, OrtSession** session)
 {
   if (loader != nullptr) {
     {
@@ -104,9 +106,17 @@ OnnxLoader::LoadSession(
       }
     }
 
-    OrtStatus* status = ort_api->CreateSessionFromArray(
-        loader->env_, model_data.c_str(), model_data.size(), session_options,
-        session);
+    OrtStatus* status = nullptr;
+    if (model_data.first) {
+      status = ort_api->CreateSessionFromArray(
+          loader->env_, model_data.second.c_str(), model_data.second.size(),
+          session_options, session);
+    } else {
+      std::string path =
+          JoinPath({model_data.second, kOnnxRuntimeOnnxFilename});
+      status = ort_api->CreateSession(
+          loader->env_, path.c_str(), session_options, session);
+    }
 
     if (status != nullptr) {
       TryRelease(true);
