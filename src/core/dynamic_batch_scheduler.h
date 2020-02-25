@@ -201,6 +201,7 @@ class PriorityQueue {
   {
     ModelQueuePolicy default_policy;
     queues_.emplace(0, RequestQueue(default_policy));
+    ResetCursor();
   }
 
   PriorityQueue(
@@ -219,6 +220,7 @@ class PriorityQueue {
         }
       }
     }
+    ResetCursor();
   }
 
   template <typename... Args>
