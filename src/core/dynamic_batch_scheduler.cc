@@ -122,6 +122,66 @@ DynamicBatchScheduler::Create(
   return Status::Success;
 }
 
+Status
+DynamicBatchScheduler::Create(
+    const uint32_t runner_id_start, const uint32_t runner_cnt, const int nice,
+    const StandardInitFunc& OnInit, const StandardWarmupFunc& OnWarmup,
+    const StandardRunFunc& OnSchedule,
+    const StandardShapeTensorPeekFunc& OnPeek,
+    const bool dynamic_batching_enabled,
+    const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+    const bool preserve_ordering,
+    const std::set<int32_t>& preferred_batch_sizes,
+    const uint64_t max_queue_delay_microseconds,
+    const ModelQueuePolicy& default_queue_policy,
+    const uint32_t priority_levels, const ModelQueuePolicyMap& queue_policy_map,
+    std::unique_ptr<Scheduler>* scheduler)
+{
+  DynamicBatchScheduler* dyna_sched = new DynamicBatchScheduler(
+      runner_id_start, runner_cnt, OnInit, OnWarmup, OnSchedule, OnPeek,
+      dynamic_batching_enabled, enforce_equal_shape_tensors, preserve_ordering,
+      preferred_batch_sizes, max_queue_delay_microseconds);
+  std::unique_ptr<DynamicBatchScheduler> sched(dyna_sched);
+
+  sched->queue_ = PriorityQueue(
+      default_queue_policy, priority_levels, queue_policy_map);
+
+  // Create one scheduler thread for each requested runner. Associate
+  // each scheduler thread with a runner.
+  for (uint32_t c = 0; c < sched->scheduler_thread_cnt_; ++c) {
+    const uint32_t runner_id = runner_id_start + c;
+    std::promise<bool> init_state;
+    auto thread_exit = std::make_shared<std::atomic<bool>>(false);
+    sched->scheduler_threads_exit_.emplace_back(thread_exit);
+    sched->scheduler_threads_.emplace_back(new std::thread(
+        [dyna_sched, runner_id, nice, thread_exit, &init_state]() {
+          dyna_sched->SchedulerThread(
+              runner_id, nice, thread_exit, &init_state);
+        }));
+    if (!init_state.get_future().get()) {
+      if (sched->scheduler_threads_.back()->joinable()) {
+        sched->scheduler_threads_.back()->join();
+      }
+      sched->scheduler_threads_exit_.pop_back();
+      sched->scheduler_threads_.pop_back();
+    }
+  }
+
+  if (sched->scheduler_threads_.empty()) {
+    return Status(
+        RequestStatusCode::INTERNAL,
+        "Initialization failed for all dynamic-batch scheduler threads");
+  }
+
+  sched->completion_queues_ =
+      std::vector<std::queue<std::shared_ptr<std::vector<Scheduler::Payload>>>>(
+          sched->scheduler_threads_.size());
+
+  scheduler->reset(sched.release());
+
+  return Status::Success;
+}
+
 DynamicBatchScheduler::~DynamicBatchScheduler()
 {
   // Signal the scheduler threads to exit and then wait for them...
@@ -279,7 +339,7 @@ DynamicBatchScheduler::SchedulerThread(
         }
         LOG_INFO << "Delaying scheduler thread " << runner_id << " until "
                  << delay_cnt
-                 << " queued payloads, current total = " << queue_.size();
+                 << " queued payloads, current total = " << queue_.Size();
       } else if (queue_.Empty()) {
         wait_microseconds = default_wait_microseconds;
       } else if (dynamic_batching_enabled_) {
@@ -389,13 +449,19 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
   // batch size would be exceeded or if the shape of the next request
   // does not match the shape of the pending batch.
   bool send_now = false;
+  if (!queue_.IsCursorValid()) {
+    queue_.ResetCursor();
+    pending_batch_size_ = 0;
+    pending_batch_queue_cnt_ = 0;
+  }
   size_t best_preferred_batch_size = 0;
   size_t best_preferred_batch_cnt = 0;
   size_t search_batch_size = pending_batch_size_;
   size_t search_batch_cnt = pending_batch_queue_cnt_;
-  for (auto idx = pending_batch_queue_cnt_; idx < queue_.Size(); ++idx) {
-    const auto batch_size =
-        queue_[idx].request_provider_->RequestHeader().batch_size();
+  while (!queue_.CursorEnd()) {
+    const auto batch_size = queue_.PayloadAtCursor()
+                                .request_provider_->RequestHeader()
+                                .batch_size();
 
     // If there is no pending batch, then this request is starting a
     // new batch.
@@ -403,8 +469,8 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
       // Get the shape of the new batch that is being started...
       if (!enforce_equal_shape_tensors_.empty()) {
         if (!InitPendingShape(
-                 runner_id, queue_[idx], enforce_equal_shape_tensors_, OnPeek_,
-                 &pending_batch_shapes_)
+                 runner_id, queue_.PayloadAtCursor(),
+                 enforce_equal_shape_tensors_, OnPeek_, &pending_batch_shapes_)
                  .IsOk()) {
           send_now = true;
           break;
@@ -422,7 +488,8 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
       // this request, so send the pending batch as it is.
       if (!enforce_equal_shape_tensors_.empty() &&
           !CompareWithPendingShape(
-              runner_id, queue_[idx], OnPeek_, pending_batch_shapes_)) {
+              runner_id, queue_.PayloadAtCursor(), OnPeek_,
+              pending_batch_shapes_)) {
         send_now = true;
         break;
       }
@@ -430,11 +497,13 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
 
     search_batch_size += batch_size;
     search_batch_cnt++;
+    queue_.Next();
 
     if (preferred_batch_sizes_.find(search_batch_size) !=
         preferred_batch_sizes_.end()) {
       best_preferred_batch_size = search_batch_size;
       best_preferred_batch_cnt = search_batch_cnt;
+      queue_.MarkCursor();
     }
   }
 
@@ -442,16 +511,16 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
   if (best_preferred_batch_size != 0) {
     pending_batch_size_ = best_preferred_batch_size;
     pending_batch_queue_cnt_ = best_preferred_batch_cnt;
+    queue_.SetCursorToMark();
     return 0;
   }
 
   pending_batch_size_ = search_batch_size;
   pending_batch_queue_cnt_ = search_batch_cnt;
 
-  // Should always have at least one request in the pending batch at
-  // this point.
+  // No request in pending batch happens when all queued requests have expired
+  // timeout and the policies are REJECT
   if (pending_batch_queue_cnt_ == 0) {
-    LOG_ERROR << "unexpected pending batch size 0";
     return 0;
   }
 
@@ -469,9 +538,7 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
   // a thread to check again at the maximum allowed delay.
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
-  const struct timespec& queued = queue_.front().stats_->Timestamp(
-      ModelInferStats::TimestampKind::kQueueStart);
-  uint64_t delay_ns = TIMESPEC_TO_NANOS(now) - TIMESPEC_TO_NANOS(queued);
+  uint64_t delay_ns = TIMESPEC_TO_NANOS(now) - queue_.OldestEnqueueTime();
 
   if (delay_ns >= pending_batch_delay_ns_) {
     return 0;
@@ -488,13 +555,16 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
   }
 
   // Return non-zero wait microseconds to cause this thread to wait
-  // until the queue delay has expired. Another thread may be awaken
+  // until the queue delay has expired, or when there is expired timeout.
+  // Another thread may be awaken
   // due to incoming request to handle the pending batch before this
   // thread wakes and that is ok. But if no other request comes in
   // then this thread will wake and revisit the pending batch (and at
   // that time will then see the delay has been exceeded and will send
   // the batch).
-  return (pending_batch_delay_ns_ - delay_ns) / 1000;
+  return std::min(
+             (pending_batch_delay_ns_ - delay_ns), queue_.ClosestTimeout()) /
+         1000;
 }
 
 void

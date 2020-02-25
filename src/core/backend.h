@@ -90,6 +90,8 @@ class InferenceBackend {
   uint32_t ProtocolVersion() const { return protocol_version_; }
   void SetProtocolVersion(const uint32_t v) { protocol_version_ = v; }
 
+  uint32_t DefaultPriorityLevel() const { return default_priority_level_; }
+
  protected:
   // Run model on the context associated with 'runner_idx' to
   // execute for one or more requests.
@@ -164,6 +166,9 @@ class InferenceBackend {
 
   // To be removed when protocol version no longer needed...
   uint32_t protocol_version_;
+
+  // The default priority level for the backend.
+  uint32_t default_priority_level_;
 };
 
 }}  // namespace nvidia::inferenceserver
